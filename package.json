@@ -1,0 +1,29 @@
+{
+  "name": "openai-compatible-api-proxy",
+  "version": "1.0.0",
+  "description": "Fast OpenAI-compatible API proxy for forwarding requests to an upstream OpenAI-compatible provider.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "openai",
+    "api",
+    "proxy",
+    "fastify",
+    "undici",
+    "streaming"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "dependencies": {
+    "@fastify/cors": "^9.0.1",
+    "dotenv": "^16.4.5",
+    "fastify": "^4.28.1",
+    "undici": "^6.19.8"
+  }
+}
