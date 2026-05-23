@@ -1,8 +1,8 @@
 services:
-  openai-compatible-api-proxy:
+  llmproxy:
     build: .
-    image: openai-compatible-api-proxy:latest
-    container_name: openai-compatible-api-proxy
+    image: llmproxy
+    container_name: llmproxy
     restart: unless-stopped
     env_file:
       - .env
