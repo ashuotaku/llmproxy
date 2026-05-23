@@ -163,6 +163,7 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
   const targetUrl = buildTargetUrl(upstreamPath, clientRequest.url);
   const method = clientRequest.method;
   const streamingForcedOff = shouldForceNonStreaming(upstreamPath);
+  const clientStreamRequested = isStreamRequested(clientRequest.body);
   const upstreamRequestBody = shouldSendBody(method)
     ? createUpstreamRequestBody(clientRequest.body, upstreamPath)
     : undefined;
@@ -178,7 +179,7 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
 
   logProxyRequest(clientRequest, targetUrl, body, {
     streamingForcedOff,
-    clientStreamRequested: isStreamRequested(clientRequest.body),
+    clientStreamRequested,
     upstreamStreamRequested: isStreamRequested(upstreamRequestBody)
   });
 
@@ -190,6 +191,21 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
       headersTimeout: HEADERS_TIMEOUT_MS,
       bodyTimeout: BODY_TIMEOUT_MS
     });
+
+    if (shouldTryEmulatedStreamingResponse({
+      upstreamPath,
+      streamingForcedOff,
+      clientStreamRequested,
+      statusCode: upstreamResponse.statusCode
+    })) {
+      return sendBufferedChatCompletionResponse({
+        upstreamResponse,
+        clientRequest,
+        reply,
+        targetUrl,
+        startedAtNs
+      });
+    }
 
     reply.code(upstreamResponse.statusCode);
     setDownstreamHeaders(reply, upstreamResponse.headers);
@@ -225,6 +241,50 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
       }
     });
   }
+}
+
+async function sendBufferedChatCompletionResponse({
+  upstreamResponse,
+  clientRequest,
+  reply,
+  targetUrl,
+  startedAtNs
+}) {
+  const responseBuffer = await readStreamToBuffer(upstreamResponse.body);
+  const emulatedStreamingBody = createEmulatedStreamingChatCompletionBody(responseBuffer);
+
+  reply.code(upstreamResponse.statusCode);
+  setDownstreamHeaders(reply, upstreamResponse.headers);
+
+  if (emulatedStreamingBody) {
+    setEmulatedStreamingHeaders(reply);
+
+    logProxyResponse(
+      clientRequest,
+      targetUrl,
+      upstreamResponse.statusCode,
+      startedAtNs,
+      createResponseLogStateFromBody(emulatedStreamingBody),
+      {
+        responseMode: 'emulated_stream'
+      }
+    );
+
+    return reply.send(emulatedStreamingBody);
+  }
+
+  logProxyResponse(
+    clientRequest,
+    targetUrl,
+    upstreamResponse.statusCode,
+    startedAtNs,
+    createResponseLogStateFromBody(responseBuffer),
+    {
+      responseMode: 'buffered'
+    }
+  );
+
+  return reply.send(responseBuffer);
 }
 
 function initialiseLogFile() {
@@ -390,8 +450,22 @@ function setDownstreamHeaders(reply, upstreamHeaders) {
   }
 }
 
+function setEmulatedStreamingHeaders(reply) {
+  reply.header('content-type', 'text/event-stream; charset=utf-8');
+  reply.header('cache-control', 'no-cache, no-transform');
+  reply.header('x-accel-buffering', 'no');
+}
+
 function shouldForceNonStreaming(upstreamPath) {
   return !STREAMING_ENABLED && upstreamPath === '/v1/chat/completions';
+}
+
+function shouldTryEmulatedStreamingResponse(options) {
+  return options.upstreamPath === '/v1/chat/completions'
+    && options.streamingForcedOff
+    && options.clientStreamRequested
+    && options.statusCode >= 200
+    && options.statusCode < 300;
 }
 
 function createUpstreamRequestBody(body, upstreamPath) {
@@ -545,7 +619,7 @@ function createLoggedResponseStream(upstreamBody, clientRequest, targetUrl, stat
   return upstreamBody.pipe(loggingStream);
 }
 
-function logProxyResponse(clientRequest, targetUrl, statusCode, startedAtNs, responseLogState) {
+function logProxyResponse(clientRequest, targetUrl, statusCode, startedAtNs, responseLogState, extraDetails = {}) {
   writeImportantLog('INFO', 'Proxy response', {
     requestId: clientRequest.id,
     method: clientRequest.method,
@@ -553,6 +627,7 @@ function logProxyResponse(clientRequest, targetUrl, statusCode, startedAtNs, res
     targetUrl,
     statusCode,
     durationMs: getElapsedMs(startedAtNs),
+    ...extraDetails,
     body: createResponseBodyLogValue(responseLogState)
   });
 }
@@ -607,6 +682,10 @@ function createResponseBodyLogValue(responseLogState) {
   };
 }
 
+function createResponseLogStateFromBody(body) {
+  return truncateLogContent(bodyToString(body));
+}
+
 function bodyToString(body) {
   if (Buffer.isBuffer(body)) {
     return body.toString('utf8');
@@ -631,6 +710,154 @@ function truncateLogContent(content) {
     truncated: true,
     content: content.slice(0, LOG_MAX_BODY_CHARS)
   };
+}
+
+async function readStreamToBuffer(stream) {
+  if (!stream) {
+    return Buffer.alloc(0);
+  }
+
+  const chunks = [];
+
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks);
+}
+
+function createEmulatedStreamingChatCompletionBody(responseBuffer) {
+  let completion;
+
+  try {
+    completion = JSON.parse(responseBuffer.toString('utf8'));
+  } catch (error) {
+    return '';
+  }
+
+  if (!completion || typeof completion !== 'object' || !Array.isArray(completion.choices)) {
+    return '';
+  }
+
+  const events = createEmulatedChatCompletionStreamEvents(completion);
+
+  if (events.length === 0) {
+    return '';
+  }
+
+  return `${events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')}data: [DONE]\n\n`;
+}
+
+function createEmulatedChatCompletionStreamEvents(completion) {
+  const events = [];
+  const baseEvent = {
+    id: completion.id,
+    object: 'chat.completion.chunk',
+    created: completion.created,
+    model: completion.model
+  };
+
+  if (completion.system_fingerprint) {
+    baseEvent.system_fingerprint = completion.system_fingerprint;
+  }
+
+  for (const [fallbackIndex, choice] of completion.choices.entries()) {
+    if (!choice || typeof choice !== 'object') {
+      continue;
+    }
+
+    const index = Number.isInteger(choice.index) ? choice.index : fallbackIndex;
+    const message = choice.message && typeof choice.message === 'object'
+      ? choice.message
+      : {};
+    const role = typeof message.role === 'string' && message.role
+      ? message.role
+      : 'assistant';
+
+    events.push({
+      ...baseEvent,
+      choices: [
+        {
+          index,
+          delta: {
+            role
+          },
+          finish_reason: null
+        }
+      ]
+    });
+
+    const content = normaliseStreamingContent(message.content);
+    if (content) {
+      events.push({
+        ...baseEvent,
+        choices: [
+          {
+            index,
+            delta: {
+              content
+            },
+            finish_reason: null
+          }
+        ]
+      });
+    }
+
+    if (message.tool_calls) {
+      events.push({
+        ...baseEvent,
+        choices: [
+          {
+            index,
+            delta: {
+              tool_calls: message.tool_calls
+            },
+            finish_reason: null
+          }
+        ]
+      });
+    }
+
+    if (message.function_call) {
+      events.push({
+        ...baseEvent,
+        choices: [
+          {
+            index,
+            delta: {
+              function_call: message.function_call
+            },
+            finish_reason: null
+          }
+        ]
+      });
+    }
+
+    events.push({
+      ...baseEvent,
+      choices: [
+        {
+          index,
+          delta: {},
+          finish_reason: choice.finish_reason || 'stop'
+        }
+      ]
+    });
+  }
+
+  return events;
+}
+
+function normaliseStreamingContent(content) {
+  if (content === undefined || content === null) {
+    return '';
+  }
+
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  return JSON.stringify(content);
 }
 
 function sanitiseHeaders(headers) {
