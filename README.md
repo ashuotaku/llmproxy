@@ -55,6 +55,28 @@ Authorization: Bearer your-upstream-api-key
 
 If PROXY_API_KEY is empty, client authentication is disabled. This is not recommended for public deployments.
 
+## Log file
+
+Logs are written to a file instead of the terminal by default.
+
+The default log file is:
+
+logs/proxy.log
+
+You can change it in .env:
+
+LOG_FILE_PATH=logs/proxy.log
+
+The logs directory is created automatically if it does not exist.
+
+To view logs while the API is running:
+
+tail -f logs/proxy.log
+
+If you want logs back in the terminal, set LOG_FILE_PATH to an empty value:
+
+LOG_FILE_PATH=
+
 ## Request and response logging
 
 The proxy logs proxied requests and responses by default.

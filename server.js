@@ -3,6 +3,8 @@
 require('dotenv').config();
 
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const { Transform } = require('node:stream');
 const Fastify = require('fastify');
 const cors = require('@fastify/cors');
@@ -11,6 +13,7 @@ const { request: undiciRequest } = require('undici');
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+const LOG_FILE_PATH = process.env.LOG_FILE_PATH || 'logs/proxy.log';
 const BODY_LIMIT_BYTES = Number(process.env.BODY_LIMIT_BYTES || 10 * 1024 * 1024);
 const HEADERS_TIMEOUT_MS = Number(process.env.HEADERS_TIMEOUT_MS || 300000);
 const BODY_TIMEOUT_MS = Number(process.env.BODY_TIMEOUT_MS || 0);
@@ -49,9 +52,7 @@ const SENSITIVE_HEADERS = new Set([
 ]);
 
 const fastify = Fastify({
-  logger: {
-    level: LOG_LEVEL
-  },
+  logger: createLoggerOptions(),
   bodyLimit: BODY_LIMIT_BYTES
 });
 
@@ -176,6 +177,24 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
       }
     });
   }
+}
+
+function createLoggerOptions() {
+  if (!LOG_FILE_PATH) {
+    return {
+      level: LOG_LEVEL
+    };
+  }
+
+  const resolvedLogFilePath = path.resolve(LOG_FILE_PATH);
+  fs.mkdirSync(path.dirname(resolvedLogFilePath), {
+    recursive: true
+  });
+
+  return {
+    level: LOG_LEVEL,
+    file: resolvedLogFilePath
+  };
 }
 
 function buildTargetUrl(upstreamPath, originalRequestUrl) {
