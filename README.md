@@ -55,6 +55,22 @@ Authorization: Bearer your-upstream-api-key
 
 If PROXY_API_KEY is empty, client authentication is disabled. This is not recommended for public deployments.
 
+## Streaming control
+
+Streaming is enabled by default.
+
+Configure it in .env:
+
+STREAMING_ENABLED=true
+
+If you want to force non-streaming upstream requests, set:
+
+STREAMING_ENABLED=false
+
+When STREAMING_ENABLED is false, the proxy will override POST /v1/chat/completions request bodies and send stream: false to the third-party API, even if the client sends stream: true.
+
+This means your client will receive a normal non-streaming JSON response from the upstream provider.
+
 ## Log file
 
 Logs are written to a file instead of the terminal by default.
@@ -85,6 +101,7 @@ Logging includes:
 
 - Request method and URL
 - Upstream target URL
+- Whether proxy streaming is enabled
 - Sanitised request headers
 - Request body preview
 - Upstream response status
@@ -124,6 +141,8 @@ curl http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer your-own-proxy-key" \
   -H "Content-Type: application/json" \
   -d "{\"model\":\"gpt-4o-mini\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Write a short poem\"}]}"
+
+If STREAMING_ENABLED=false in .env, this request is sent upstream as a non-streaming request.
 
 ## Example embeddings request
 

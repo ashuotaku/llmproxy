@@ -17,6 +17,7 @@ const LOG_FILE_PATH = process.env.LOG_FILE_PATH || 'logs/proxy.log';
 const BODY_LIMIT_BYTES = Number(process.env.BODY_LIMIT_BYTES || 10 * 1024 * 1024);
 const HEADERS_TIMEOUT_MS = Number(process.env.HEADERS_TIMEOUT_MS || 300000);
 const BODY_TIMEOUT_MS = Number(process.env.BODY_TIMEOUT_MS || 0);
+const STREAMING_ENABLED = parseBoolean(process.env.STREAMING_ENABLED, true);
 const REQUEST_RESPONSE_LOGGING = parseBoolean(process.env.REQUEST_RESPONSE_LOGGING, true);
 const LOG_BODY_CONTENT = parseBoolean(process.env.LOG_BODY_CONTENT, true);
 const LOG_MAX_BODY_CHARS = toPositiveInteger(process.env.LOG_MAX_BODY_CHARS || '20000', 20000);
@@ -133,7 +134,10 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
   const targetUrl = buildTargetUrl(upstreamPath, clientRequest.url);
   const method = clientRequest.method;
   const headers = buildUpstreamHeaders(clientRequest.headers);
-  const body = shouldSendBody(method) ? serialiseBody(clientRequest.body) : undefined;
+  const upstreamRequestBody = shouldSendBody(method)
+    ? createUpstreamRequestBody(clientRequest.body, upstreamPath)
+    : undefined;
+  const body = shouldSendBody(method) ? serialiseBody(upstreamRequestBody) : undefined;
 
   if (body !== undefined && !headers['content-type']) {
     headers['content-type'] = getHeader(clientRequest.headers, 'content-type') || 'application/json';
@@ -256,6 +260,56 @@ function setDownstreamHeaders(reply, upstreamHeaders) {
   }
 }
 
+function createUpstreamRequestBody(body, upstreamPath) {
+  if (STREAMING_ENABLED || upstreamPath !== '/v1/chat/completions') {
+    return body;
+  }
+
+  return disableStreamingInBody(body);
+}
+
+function disableStreamingInBody(body) {
+  if (body === undefined || body === null) {
+    return body;
+  }
+
+  if (Buffer.isBuffer(body)) {
+    return disableStreamingInJsonString(body.toString('utf8'), body);
+  }
+
+  if (typeof body === 'string') {
+    return disableStreamingInJsonString(body, body);
+  }
+
+  if (typeof body === 'object' && !Array.isArray(body)) {
+    return {
+      ...body,
+      stream: false
+    };
+  }
+
+  return body;
+}
+
+function disableStreamingInJsonString(content, fallback) {
+  let parsed;
+
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    return fallback;
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return fallback;
+  }
+
+  return JSON.stringify({
+    ...parsed,
+    stream: false
+  });
+}
+
 function logProxyRequest(clientRequest, targetUrl, body) {
   if (!REQUEST_RESPONSE_LOGGING) {
     return;
@@ -266,6 +320,7 @@ function logProxyRequest(clientRequest, targetUrl, body) {
       method: clientRequest.method,
       url: clientRequest.url,
       targetUrl,
+      streamingEnabled: STREAMING_ENABLED,
       headers: sanitiseHeaders(clientRequest.headers),
       body: createBodyLogValue(body)
     }
