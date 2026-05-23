@@ -63,13 +63,25 @@ Configure it in .env:
 
 STREAMING_ENABLED=true
 
-If you want to force non-streaming upstream requests, set:
+If you want to force non-streaming upstream requests, set any one of these values:
 
 STREAMING_ENABLED=false
+STREAMING_ENABLED=off
+STREAMING_ENABLED=no
+STREAMING_ENABLED=0
 
-When STREAMING_ENABLED is false, the proxy will override POST /v1/chat/completions request bodies and send stream: false to the third-party API, even if the client sends stream: true.
+When STREAMING_ENABLED is false or off, the proxy will override POST /v1/chat/completions request bodies and send stream: false to the third-party API, even if the client sends stream: true.
+
+The proxy also forces the upstream Accept header to application/json for chat completions when streaming is disabled. This prevents providers that use Accept: text/event-stream as a streaming signal from returning a streaming response.
 
 This means your client will receive a normal non-streaming JSON response from the upstream provider.
+
+You can confirm this in logs. For a chat completion request with streaming disabled, the request log should show:
+
+streamingEnabled: false
+streamingForcedOff: true
+clientStreamRequested: true
+upstreamStreamRequested: false
 
 ## Log file
 
@@ -102,6 +114,9 @@ Logging includes:
 - Request method and URL
 - Upstream target URL
 - Whether proxy streaming is enabled
+- Whether streaming was forced off
+- Whether the client requested streaming
+- Whether the upstream request has streaming enabled
 - Sanitised request headers
 - Request body preview
 - Upstream response status
@@ -142,7 +157,7 @@ curl http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d "{\"model\":\"gpt-4o-mini\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Write a short poem\"}]}"
 
-If STREAMING_ENABLED=false in .env, this request is sent upstream as a non-streaming request.
+If STREAMING_ENABLED=false or STREAMING_ENABLED=off in .env, this request is sent upstream as a non-streaming request with stream: false.
 
 ## Example embeddings request
 

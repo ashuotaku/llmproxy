@@ -42,6 +42,11 @@ const HOP_BY_HOP_RESPONSE_HEADERS = new Set([
   'content-length'
 ]);
 
+const STREAMING_REQUEST_HEADERS = new Set([
+  'cache-control',
+  'x-accel-buffering'
+]);
+
 const SENSITIVE_HEADERS = new Set([
   'authorization',
   'cookie',
@@ -133,17 +138,25 @@ fastify.setErrorHandler((error, request, reply) => {
 async function proxyToUpstream(clientRequest, reply, upstreamPath) {
   const targetUrl = buildTargetUrl(upstreamPath, clientRequest.url);
   const method = clientRequest.method;
-  const headers = buildUpstreamHeaders(clientRequest.headers);
+  const streamingForcedOff = shouldForceNonStreaming(upstreamPath);
   const upstreamRequestBody = shouldSendBody(method)
     ? createUpstreamRequestBody(clientRequest.body, upstreamPath)
     : undefined;
   const body = shouldSendBody(method) ? serialiseBody(upstreamRequestBody) : undefined;
+  const headers = buildUpstreamHeaders(clientRequest.headers, {
+    upstreamPath,
+    streamingForcedOff
+  });
 
   if (body !== undefined && !headers['content-type']) {
     headers['content-type'] = getHeader(clientRequest.headers, 'content-type') || 'application/json';
   }
 
-  logProxyRequest(clientRequest, targetUrl, body);
+  logProxyRequest(clientRequest, targetUrl, body, {
+    streamingForcedOff,
+    clientStreamRequested: isStreamRequested(clientRequest.body),
+    upstreamStreamRequested: isStreamRequested(upstreamRequestBody)
+  });
 
   try {
     const upstreamResponse = await undiciRequest(targetUrl, {
@@ -214,7 +227,7 @@ function buildTargetUrl(upstreamPath, originalRequestUrl) {
   return `${UPSTREAM_BASE_URL}${pathToAppend}${localUrl.search}`;
 }
 
-function buildUpstreamHeaders(incomingHeaders) {
+function buildUpstreamHeaders(incomingHeaders, options = {}) {
   const headers = {
     accept: getHeader(incomingHeaders, 'accept') || 'application/json',
     'accept-encoding': 'identity'
@@ -242,6 +255,19 @@ function buildUpstreamHeaders(incomingHeaders) {
     headers['openai-project'] = UPSTREAM_PROJECT;
   }
 
+  const contentType = getHeader(incomingHeaders, 'content-type');
+  if (contentType) {
+    headers['content-type'] = contentType;
+  }
+
+  if (options.streamingForcedOff && options.upstreamPath === '/v1/chat/completions') {
+    headers.accept = 'application/json';
+
+    for (const headerName of STREAMING_REQUEST_HEADERS) {
+      delete headers[headerName];
+    }
+  }
+
   return {
     ...headers,
     ...UPSTREAM_EXTRA_HEADERS
@@ -260,8 +286,12 @@ function setDownstreamHeaders(reply, upstreamHeaders) {
   }
 }
 
+function shouldForceNonStreaming(upstreamPath) {
+  return !STREAMING_ENABLED && upstreamPath === '/v1/chat/completions';
+}
+
 function createUpstreamRequestBody(body, upstreamPath) {
-  if (STREAMING_ENABLED || upstreamPath !== '/v1/chat/completions') {
+  if (!shouldForceNonStreaming(upstreamPath)) {
     return body;
   }
 
@@ -310,7 +340,43 @@ function disableStreamingInJsonString(content, fallback) {
   });
 }
 
-function logProxyRequest(clientRequest, targetUrl, body) {
+function isStreamRequested(body) {
+  if (body === undefined || body === null) {
+    return false;
+  }
+
+  if (Buffer.isBuffer(body)) {
+    return isStreamRequestedInJsonString(body.toString('utf8'));
+  }
+
+  if (typeof body === 'string') {
+    return isStreamRequestedInJsonString(body);
+  }
+
+  if (typeof body === 'object' && !Array.isArray(body)) {
+    return body.stream === true;
+  }
+
+  return false;
+}
+
+function isStreamRequestedInJsonString(content) {
+  let parsed;
+
+  try {
+    parsed = JSON.parse(content);
+  } catch (error) {
+    return false;
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return false;
+  }
+
+  return parsed.stream === true;
+}
+
+function logProxyRequest(clientRequest, targetUrl, body, streamingInfo = {}) {
   if (!REQUEST_RESPONSE_LOGGING) {
     return;
   }
@@ -321,6 +387,9 @@ function logProxyRequest(clientRequest, targetUrl, body) {
       url: clientRequest.url,
       targetUrl,
       streamingEnabled: STREAMING_ENABLED,
+      streamingForcedOff: Boolean(streamingInfo.streamingForcedOff),
+      clientStreamRequested: Boolean(streamingInfo.clientStreamRequested),
+      upstreamStreamRequested: Boolean(streamingInfo.upstreamStreamRequested),
       headers: sanitiseHeaders(clientRequest.headers),
       body: createBodyLogValue(body)
     }
@@ -573,7 +642,17 @@ function parseBoolean(value, defaultValue = false) {
     return defaultValue;
   }
 
-  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+  const normalisedValue = String(value).trim().toLowerCase();
+
+  if (['1', 'true', 'yes', 'on'].includes(normalisedValue)) {
+    return true;
+  }
+
+  if (['0', 'false', 'no', 'off'].includes(normalisedValue)) {
+    return false;
+  }
+
+  return defaultValue;
 }
 
 function toPositiveInteger(value, fallback) {
