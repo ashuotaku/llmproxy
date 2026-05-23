@@ -13,7 +13,9 @@ const { request: undiciRequest } = require('undici');
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
-const LOG_FILE_PATH = process.env.LOG_FILE_PATH || 'logs/proxy.log';
+const LOG_FILE_PATH = process.env.LOG_FILE_PATH === undefined
+  ? 'logs/proxy.log'
+  : process.env.LOG_FILE_PATH.trim();
 const BODY_LIMIT_BYTES = Number(process.env.BODY_LIMIT_BYTES || 10 * 1024 * 1024);
 const HEADERS_TIMEOUT_MS = Number(process.env.HEADERS_TIMEOUT_MS || 300000);
 const BODY_TIMEOUT_MS = Number(process.env.BODY_TIMEOUT_MS || 0);
@@ -57,8 +59,11 @@ const SENSITIVE_HEADERS = new Set([
   'openai-api-key'
 ]);
 
+initialiseLogFile();
+
 const fastify = Fastify({
-  logger: createLoggerOptions(),
+  logger: false,
+  disableRequestLogging: true,
   bodyLimit: BODY_LIMIT_BYTES
 });
 
@@ -80,6 +85,13 @@ fastify.addHook('preHandler', async (request, reply) => {
   const token = extractBearerToken(authHeader);
 
   if (!token || !safeEqual(token, PROXY_API_KEY)) {
+    writeImportantLog('WARN', 'Unauthorized request', {
+      requestId: request.id,
+      method: request.method,
+      url: request.url,
+      remoteAddress: request.ip
+    });
+
     return reply.code(401).send({
       error: {
         message: 'Unauthorized. Provide a valid Bearer token.',
@@ -110,6 +122,12 @@ fastify.get('/v1/models', async (request, reply) => {
 });
 
 fastify.all('/v1/*', async (request, reply) => {
+  writeImportantLog('WARN', 'Endpoint not configured', {
+    requestId: request.id,
+    method: request.method,
+    url: request.url
+  });
+
   return reply.code(404).send({
     error: {
       message: `Endpoint not configured on proxy: ${request.method} ${request.url}`,
@@ -120,7 +138,12 @@ fastify.all('/v1/*', async (request, reply) => {
 });
 
 fastify.setErrorHandler((error, request, reply) => {
-  request.log.error({ error }, 'Request failed');
+  writeImportantLog('ERROR', 'Request failed', {
+    requestId: request.id,
+    method: request.method,
+    url: request.url,
+    error: createErrorLogValue(error)
+  });
 
   if (reply.sent) {
     return;
@@ -136,6 +159,7 @@ fastify.setErrorHandler((error, request, reply) => {
 });
 
 async function proxyToUpstream(clientRequest, reply, upstreamPath) {
+  const startedAtNs = process.hrtime.bigint();
   const targetUrl = buildTargetUrl(upstreamPath, clientRequest.url);
   const method = clientRequest.method;
   const streamingForcedOff = shouldForceNonStreaming(upstreamPath);
@@ -175,12 +199,19 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
       clientRequest,
       targetUrl,
       upstreamResponse.statusCode,
-      upstreamResponse.headers
+      startedAtNs
     );
 
     return reply.send(responseBody);
   } catch (error) {
-    clientRequest.log.error({ error, targetUrl }, 'Upstream request failed');
+    writeImportantLog('ERROR', 'Upstream request failed', {
+      requestId: clientRequest.id,
+      method,
+      url: clientRequest.url,
+      targetUrl,
+      durationMs: getElapsedMs(startedAtNs),
+      error: createErrorLogValue(error)
+    });
 
     if (reply.sent) {
       return;
@@ -196,22 +227,93 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
   }
 }
 
-function createLoggerOptions() {
+function initialiseLogFile() {
   if (!LOG_FILE_PATH) {
-    return {
-      level: LOG_LEVEL
-    };
+    return;
   }
 
   const resolvedLogFilePath = path.resolve(LOG_FILE_PATH);
+
   fs.mkdirSync(path.dirname(resolvedLogFilePath), {
     recursive: true
   });
+}
 
-  return {
-    level: LOG_LEVEL,
-    file: resolvedLogFilePath
+function writeImportantLog(level, message, details = {}) {
+  const line = formatImportantLogLine(level, message, details);
+
+  if (!LOG_FILE_PATH) {
+    if (level === 'ERROR') {
+      console.error(line);
+      return;
+    }
+
+    console.log(line);
+    return;
+  }
+
+  try {
+    fs.appendFileSync(path.resolve(LOG_FILE_PATH), `${line}\n`, 'utf8');
+  } catch (error) {
+    console.error(formatImportantLogLine('ERROR', 'Failed to write log file', {
+      logFilePath: LOG_FILE_PATH,
+      error: createErrorLogValue(error)
+    }));
+    console.error(line);
+  }
+}
+
+function formatImportantLogLine(level, message, details) {
+  const timestamp = new Date().toISOString();
+  const parts = [
+    `[${timestamp}]`,
+    level,
+    message
+  ];
+
+  for (const [key, value] of Object.entries(details || {})) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+
+    parts.push(`${key}=${formatLogValue(value)}`);
+  }
+
+  return parts.join(' ');
+}
+
+function formatLogValue(value) {
+  if (typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+
+  return JSON.stringify(value);
+}
+
+function createErrorLogValue(error) {
+  if (!error) {
+    return undefined;
+  }
+
+  const value = {
+    name: error.name,
+    message: error.message
   };
+
+  if (LOG_LEVEL === 'debug' && error.stack) {
+    value.stack = error.stack;
+  }
+
+  return value;
+}
+
+function getElapsedMs(startedAtNs) {
+  const elapsedMs = Number(process.hrtime.bigint() - startedAtNs) / 1_000_000;
+  return Math.round(elapsedMs * 100) / 100;
 }
 
 function buildTargetUrl(upstreamPath, originalRequestUrl) {
@@ -260,18 +362,20 @@ function buildUpstreamHeaders(incomingHeaders, options = {}) {
     headers['content-type'] = contentType;
   }
 
-  if (options.streamingForcedOff && options.upstreamPath === '/v1/chat/completions') {
-    headers.accept = 'application/json';
-
-    for (const headerName of STREAMING_REQUEST_HEADERS) {
-      delete headers[headerName];
-    }
-  }
-
-  return {
+  const finalHeaders = {
     ...headers,
     ...UPSTREAM_EXTRA_HEADERS
   };
+
+  if (options.streamingForcedOff && options.upstreamPath === '/v1/chat/completions') {
+    finalHeaders.accept = 'application/json';
+
+    for (const headerName of STREAMING_REQUEST_HEADERS) {
+      delete finalHeaders[headerName];
+    }
+  }
+
+  return finalHeaders;
 }
 
 function setDownstreamHeaders(reply, upstreamHeaders) {
@@ -381,28 +485,26 @@ function logProxyRequest(clientRequest, targetUrl, body, streamingInfo = {}) {
     return;
   }
 
-  clientRequest.log.info({
-    proxyRequest: {
-      method: clientRequest.method,
-      url: clientRequest.url,
-      targetUrl,
-      streamingEnabled: STREAMING_ENABLED,
-      streamingForcedOff: Boolean(streamingInfo.streamingForcedOff),
-      clientStreamRequested: Boolean(streamingInfo.clientStreamRequested),
-      upstreamStreamRequested: Boolean(streamingInfo.upstreamStreamRequested),
-      headers: sanitiseHeaders(clientRequest.headers),
-      body: createBodyLogValue(body)
-    }
-  }, 'Proxy request');
+  writeImportantLog('INFO', 'Proxy request', {
+    requestId: clientRequest.id,
+    method: clientRequest.method,
+    url: clientRequest.url,
+    targetUrl,
+    streamingEnabled: STREAMING_ENABLED,
+    streamingForcedOff: Boolean(streamingInfo.streamingForcedOff),
+    clientStreamRequested: Boolean(streamingInfo.clientStreamRequested),
+    upstreamStreamRequested: Boolean(streamingInfo.upstreamStreamRequested),
+    body: createBodyLogValue(body)
+  });
 }
 
-function createLoggedResponseStream(upstreamBody, clientRequest, targetUrl, statusCode, headers) {
+function createLoggedResponseStream(upstreamBody, clientRequest, targetUrl, statusCode, startedAtNs) {
   if (!REQUEST_RESPONSE_LOGGING) {
     return upstreamBody;
   }
 
   if (!upstreamBody) {
-    logProxyResponse(clientRequest, targetUrl, statusCode, headers, {
+    logProxyResponse(clientRequest, targetUrl, statusCode, startedAtNs, {
       truncated: false,
       content: ''
     });
@@ -422,30 +524,37 @@ function createLoggedResponseStream(upstreamBody, clientRequest, targetUrl, stat
       callback();
     },
     flush(callback) {
-      logProxyResponse(clientRequest, targetUrl, statusCode, headers, responseLogState);
+      logProxyResponse(clientRequest, targetUrl, statusCode, startedAtNs, responseLogState);
       callback();
     }
   });
 
   upstreamBody.on('error', (error) => {
-    clientRequest.log.error({ error, targetUrl }, 'Upstream response stream failed');
+    writeImportantLog('ERROR', 'Upstream response stream failed', {
+      requestId: clientRequest.id,
+      method: clientRequest.method,
+      url: clientRequest.url,
+      targetUrl,
+      durationMs: getElapsedMs(startedAtNs),
+      error: createErrorLogValue(error)
+    });
+
     loggingStream.destroy(error);
   });
 
   return upstreamBody.pipe(loggingStream);
 }
 
-function logProxyResponse(clientRequest, targetUrl, statusCode, headers, responseLogState) {
-  clientRequest.log.info({
-    proxyResponse: {
-      method: clientRequest.method,
-      url: clientRequest.url,
-      targetUrl,
-      statusCode,
-      headers: sanitiseHeaders(headers),
-      body: createResponseBodyLogValue(responseLogState)
-    }
-  }, 'Proxy response');
+function logProxyResponse(clientRequest, targetUrl, statusCode, startedAtNs, responseLogState) {
+  writeImportantLog('INFO', 'Proxy response', {
+    requestId: clientRequest.id,
+    method: clientRequest.method,
+    url: clientRequest.url,
+    targetUrl,
+    statusCode,
+    durationMs: getElapsedMs(startedAtNs),
+    body: createResponseBodyLogValue(responseLogState)
+  });
 }
 
 function captureLogChunk(responseLogState, chunk) {
@@ -678,9 +787,19 @@ async function start() {
     port: PORT,
     host: HOST
   });
+
+  writeImportantLog('INFO', 'Server started', {
+    host: HOST,
+    port: PORT,
+    upstreamBaseUrl: UPSTREAM_BASE_URL,
+    streamingEnabled: STREAMING_ENABLED,
+    logFilePath: LOG_FILE_PATH || '[terminal]'
+  });
 }
 
 start().catch((error) => {
-  fastify.log.error(error);
+  writeImportantLog('ERROR', 'Server failed to start', {
+    error: createErrorLogValue(error)
+  });
   process.exit(1);
 });

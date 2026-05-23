@@ -76,12 +76,12 @@ The proxy also forces the upstream Accept header to application/json for chat co
 
 This means your client will receive a normal non-streaming JSON response from the upstream provider.
 
-You can confirm this in logs. For a chat completion request with streaming disabled, the request log should show:
+You can confirm this in logs. For a chat completion request with streaming disabled, the request log should show these fields:
 
-streamingEnabled: false
-streamingForcedOff: true
-clientStreamRequested: true
-upstreamStreamRequested: false
+streamingEnabled=false
+streamingForcedOff=true
+clientStreamRequested=true
+upstreamStreamRequested=false
 
 ## Log file
 
@@ -105,25 +105,33 @@ If you want logs back in the terminal, set LOG_FILE_PATH to an empty value:
 
 LOG_FILE_PATH=
 
+## Clean important logs
+
+The proxy stores clean plain-text logs instead of noisy Fastify JSON logs.
+
+Fastify automatic logs such as incoming request and request completed are disabled.
+
+Normal proxy logs include only important fields:
+
+- Request id
+- Request method
+- Proxy URL
+- Upstream target URL
+- Streaming status
+- Upstream response status code
+- Response duration
+- Request body preview, if body logging is enabled
+- Response body preview, if body logging is enabled
+
+Example log lines look like this:
+
+[2026-05-23T18:52:05.448Z] INFO Proxy request requestId="req-v" method="POST" url="/v1/chat/completions" targetUrl="https://api.example.com/v1/chat/completions" streamingEnabled=false streamingForcedOff=true clientStreamRequested=true upstreamStreamRequested=false body={"truncated":false,"content":"{\"stream\":false,\"model\":\"gpt-4o-mini\"}"}
+
+[2026-05-23T18:52:05.448Z] INFO Proxy response requestId="req-v" method="POST" url="/v1/chat/completions" targetUrl="https://api.example.com/v1/chat/completions" statusCode=200 durationMs=10700.11 body={"truncated":false,"content":"{\"id\":\"chat_123\",\"object\":\"chat.completion\"}"}
+
 ## Request and response logging
 
 The proxy logs proxied requests and responses by default.
-
-Logging includes:
-
-- Request method and URL
-- Upstream target URL
-- Whether proxy streaming is enabled
-- Whether streaming was forced off
-- Whether the client requested streaming
-- Whether the upstream request has streaming enabled
-- Sanitised request headers
-- Request body preview
-- Upstream response status
-- Sanitised response headers
-- Response body preview
-
-Sensitive headers are redacted automatically. This includes headers such as authorization, cookie, set-cookie, proxy-authorization, x-api-key, api-key, and openai-api-key.
 
 Configure logging in .env:
 
