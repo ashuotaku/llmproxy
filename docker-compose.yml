@@ -1,0 +1,15 @@
+services:
+  openai-compatible-api-proxy:
+    build: .
+    image: openai-compatible-api-proxy:latest
+    container_name: openai-compatible-api-proxy
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: ${PORT:-3000}
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    volumes:
+      - ./logs:/app/logs

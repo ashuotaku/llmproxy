@@ -43,6 +43,71 @@ The proxy will run on:
 
 http://localhost:3000
 
+## Docker setup
+
+You can also run the proxy using Docker.
+
+1. Create your environment file
+
+cp .env.example .env
+
+2. Edit .env
+
+Set at least:
+
+UPSTREAM_BASE_URL=https://your-provider.example.com/v1
+UPSTREAM_API_KEY=your-upstream-api-key
+PROXY_API_KEY=your-own-proxy-key
+
+3. Build the Docker image
+
+docker build -t openai-compatible-api-proxy .
+
+4. Run the container
+
+docker run --rm \
+  --name openai-compatible-api-proxy \
+  --env-file .env \
+  -p 3000:3000 \
+  -v "$(pwd)/logs:/app/logs" \
+  openai-compatible-api-proxy
+
+The proxy will be available at:
+
+http://localhost:3000
+
+If you are running this on Windows Command Prompt, use this command instead:
+
+docker run --rm --name openai-compatible-api-proxy --env-file .env -p 3000:3000 -v "%cd%/logs:/app/logs" openai-compatible-api-proxy
+
+## Docker Compose setup
+
+Docker Compose is the easiest way to run the proxy in Docker.
+
+1. Create your environment file
+
+cp .env.example .env
+
+2. Edit .env with your upstream and proxy API keys.
+
+3. Start the proxy
+
+docker compose up -d
+
+4. View container logs
+
+docker compose logs -f
+
+5. Stop the proxy
+
+docker compose down
+
+By default, Docker Compose maps the proxy to:
+
+http://localhost:3000
+
+If you set a different PORT in .env, Docker Compose will use that port.
+
 ## Authentication
 
 Your apps should call the proxy using the proxy API key:
@@ -110,6 +175,12 @@ tail -f logs/proxy.log
 If you want logs back in the terminal, set LOG_FILE_PATH to an empty value:
 
 LOG_FILE_PATH=
+
+When running with Docker or Docker Compose, the local logs directory can be mounted into the container:
+
+./logs:/app/logs
+
+This means logs written inside the container are still visible on your machine in the logs folder.
 
 ## Clean important logs
 
