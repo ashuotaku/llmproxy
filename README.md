@@ -55,6 +55,40 @@ Authorization: Bearer your-upstream-api-key
 
 If PROXY_API_KEY is empty, client authentication is disabled. This is not recommended for public deployments.
 
+## Request and response logging
+
+The proxy logs proxied requests and responses by default.
+
+Logging includes:
+
+- Request method and URL
+- Upstream target URL
+- Sanitised request headers
+- Request body preview
+- Upstream response status
+- Sanitised response headers
+- Response body preview
+
+Sensitive headers are redacted automatically. This includes headers such as authorization, cookie, set-cookie, proxy-authorization, x-api-key, api-key, and openai-api-key.
+
+Configure logging in .env:
+
+REQUEST_RESPONSE_LOGGING=true
+LOG_BODY_CONTENT=true
+LOG_MAX_BODY_CHARS=20000
+
+To disable all request and response proxy logs:
+
+REQUEST_RESPONSE_LOGGING=false
+
+To keep request and response metadata logs but hide body content:
+
+LOG_BODY_CONTENT=false
+
+LOG_MAX_BODY_CHARS controls the maximum number of body characters stored in logs per request or response. Larger bodies are truncated.
+
+Important: request and response bodies can contain prompts, user data, embeddings input, and model output. In production, disable body logging if these logs may contain sensitive data.
+
 ## Example chat completion request
 
 curl http://localhost:3000/v1/chat/completions \

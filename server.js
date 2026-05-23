@@ -3,6 +3,7 @@
 require('dotenv').config();
 
 const crypto = require('node:crypto');
+const { Transform } = require('node:stream');
 const Fastify = require('fastify');
 const cors = require('@fastify/cors');
 const { request: undiciRequest } = require('undici');
@@ -13,6 +14,9 @@ const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const BODY_LIMIT_BYTES = Number(process.env.BODY_LIMIT_BYTES || 10 * 1024 * 1024);
 const HEADERS_TIMEOUT_MS = Number(process.env.HEADERS_TIMEOUT_MS || 300000);
 const BODY_TIMEOUT_MS = Number(process.env.BODY_TIMEOUT_MS || 0);
+const REQUEST_RESPONSE_LOGGING = parseBoolean(process.env.REQUEST_RESPONSE_LOGGING, true);
+const LOG_BODY_CONTENT = parseBoolean(process.env.LOG_BODY_CONTENT, true);
+const LOG_MAX_BODY_CHARS = toPositiveInteger(process.env.LOG_MAX_BODY_CHARS || '20000', 20000);
 
 const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
 const UPSTREAM_BASE_URL = normaliseBaseUrl(process.env.UPSTREAM_BASE_URL || '');
@@ -32,6 +36,16 @@ const HOP_BY_HOP_RESPONSE_HEADERS = new Set([
   'upgrade',
   'host',
   'content-length'
+]);
+
+const SENSITIVE_HEADERS = new Set([
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'proxy-authorization',
+  'x-api-key',
+  'api-key',
+  'openai-api-key'
 ]);
 
 const fastify = Fastify({
@@ -124,6 +138,8 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
     headers['content-type'] = getHeader(clientRequest.headers, 'content-type') || 'application/json';
   }
 
+  logProxyRequest(clientRequest, targetUrl, body);
+
   try {
     const upstreamResponse = await undiciRequest(targetUrl, {
       method,
@@ -136,7 +152,15 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
     reply.code(upstreamResponse.statusCode);
     setDownstreamHeaders(reply, upstreamResponse.headers);
 
-    return reply.send(upstreamResponse.body);
+    const responseBody = createLoggedResponseStream(
+      upstreamResponse.body,
+      clientRequest,
+      targetUrl,
+      upstreamResponse.statusCode,
+      upstreamResponse.headers
+    );
+
+    return reply.send(responseBody);
   } catch (error) {
     clientRequest.log.error({ error, targetUrl }, 'Upstream request failed');
 
@@ -211,6 +235,167 @@ function setDownstreamHeaders(reply, upstreamHeaders) {
 
     reply.header(key, value);
   }
+}
+
+function logProxyRequest(clientRequest, targetUrl, body) {
+  if (!REQUEST_RESPONSE_LOGGING) {
+    return;
+  }
+
+  clientRequest.log.info({
+    proxyRequest: {
+      method: clientRequest.method,
+      url: clientRequest.url,
+      targetUrl,
+      headers: sanitiseHeaders(clientRequest.headers),
+      body: createBodyLogValue(body)
+    }
+  }, 'Proxy request');
+}
+
+function createLoggedResponseStream(upstreamBody, clientRequest, targetUrl, statusCode, headers) {
+  if (!REQUEST_RESPONSE_LOGGING) {
+    return upstreamBody;
+  }
+
+  if (!upstreamBody) {
+    logProxyResponse(clientRequest, targetUrl, statusCode, headers, {
+      truncated: false,
+      content: ''
+    });
+
+    return upstreamBody;
+  }
+
+  const responseLogState = {
+    truncated: false,
+    content: ''
+  };
+
+  const loggingStream = new Transform({
+    transform(chunk, encoding, callback) {
+      captureLogChunk(responseLogState, chunk);
+      this.push(chunk);
+      callback();
+    },
+    flush(callback) {
+      logProxyResponse(clientRequest, targetUrl, statusCode, headers, responseLogState);
+      callback();
+    }
+  });
+
+  upstreamBody.on('error', (error) => {
+    clientRequest.log.error({ error, targetUrl }, 'Upstream response stream failed');
+    loggingStream.destroy(error);
+  });
+
+  return upstreamBody.pipe(loggingStream);
+}
+
+function logProxyResponse(clientRequest, targetUrl, statusCode, headers, responseLogState) {
+  clientRequest.log.info({
+    proxyResponse: {
+      method: clientRequest.method,
+      url: clientRequest.url,
+      targetUrl,
+      statusCode,
+      headers: sanitiseHeaders(headers),
+      body: createResponseBodyLogValue(responseLogState)
+    }
+  }, 'Proxy response');
+}
+
+function captureLogChunk(responseLogState, chunk) {
+  if (!LOG_BODY_CONTENT) {
+    return;
+  }
+
+  if (responseLogState.content.length >= LOG_MAX_BODY_CHARS) {
+    responseLogState.truncated = true;
+    return;
+  }
+
+  const chunkText = Buffer.isBuffer(chunk)
+    ? chunk.toString('utf8')
+    : Buffer.from(chunk).toString('utf8');
+
+  const remainingChars = LOG_MAX_BODY_CHARS - responseLogState.content.length;
+
+  if (chunkText.length > remainingChars) {
+    responseLogState.content += chunkText.slice(0, remainingChars);
+    responseLogState.truncated = true;
+    return;
+  }
+
+  responseLogState.content += chunkText;
+}
+
+function createBodyLogValue(body) {
+  if (!LOG_BODY_CONTENT) {
+    return '[body logging disabled]';
+  }
+
+  if (body === undefined || body === null) {
+    return undefined;
+  }
+
+  const content = bodyToString(body);
+
+  return truncateLogContent(content);
+}
+
+function createResponseBodyLogValue(responseLogState) {
+  if (!LOG_BODY_CONTENT) {
+    return '[body logging disabled]';
+  }
+
+  return {
+    truncated: responseLogState.truncated,
+    content: responseLogState.content
+  };
+}
+
+function bodyToString(body) {
+  if (Buffer.isBuffer(body)) {
+    return body.toString('utf8');
+  }
+
+  if (typeof body === 'string') {
+    return body;
+  }
+
+  return JSON.stringify(body);
+}
+
+function truncateLogContent(content) {
+  if (content.length <= LOG_MAX_BODY_CHARS) {
+    return {
+      truncated: false,
+      content
+    };
+  }
+
+  return {
+    truncated: true,
+    content: content.slice(0, LOG_MAX_BODY_CHARS)
+  };
+}
+
+function sanitiseHeaders(headers) {
+  const sanitised = {};
+
+  for (const [key, value] of Object.entries(headers || {})) {
+    const lowerKey = key.toLowerCase();
+
+    if (SENSITIVE_HEADERS.has(lowerKey)) {
+      sanitised[lowerKey] = '[redacted]';
+      continue;
+    }
+
+    sanitised[lowerKey] = Array.isArray(value) ? value.join(', ') : value;
+  }
+
+  return sanitised;
 }
 
 function serialiseBody(body) {
@@ -307,6 +492,24 @@ function parseExtraHeaders(value) {
   }
 
   return headers;
+}
+
+function parseBoolean(value, defaultValue = false) {
+  if (value === undefined || value === null || value === '') {
+    return defaultValue;
+  }
+
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+}
+
+function toPositiveInteger(value, fallback) {
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return Math.floor(parsed);
 }
 
 function validateConfig() {
