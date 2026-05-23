@@ -23,6 +23,8 @@ const STREAMING_ENABLED = parseBoolean(process.env.STREAMING_ENABLED, true);
 const REQUEST_RESPONSE_LOGGING = parseBoolean(process.env.REQUEST_RESPONSE_LOGGING, true);
 const LOG_BODY_CONTENT = parseBoolean(process.env.LOG_BODY_CONTENT, true);
 const LOG_MAX_BODY_CHARS = toPositiveInteger(process.env.LOG_MAX_BODY_CHARS || '20000', 20000);
+const NORMALISE_STREAMING_REASONING = parseBoolean(process.env.NORMALISE_STREAMING_REASONING, true);
+const STRIP_STREAMING_REASONING = parseBoolean(process.env.STRIP_STREAMING_REASONING, false);
 
 const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
 const UPSTREAM_BASE_URL = normaliseBaseUrl(process.env.UPSTREAM_BASE_URL || '');
@@ -210,8 +212,29 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
     reply.code(upstreamResponse.statusCode);
     setDownstreamHeaders(reply, upstreamResponse.headers);
 
+    let upstreamBodyForReply = upstreamResponse.body;
+
+    if (upstreamBodyForReply && shouldNormaliseStreamingChatCompletionResponse({
+      upstreamPath,
+      streamingForcedOff,
+      clientStreamRequested,
+      statusCode: upstreamResponse.statusCode
+    })) {
+      const compatibilityTransform = createChatCompletionStreamCompatibilityTransform(
+        clientRequest,
+        targetUrl,
+        startedAtNs
+      );
+
+      upstreamResponse.body.on('error', (error) => {
+        compatibilityTransform.destroy(error);
+      });
+
+      upstreamBodyForReply = upstreamResponse.body.pipe(compatibilityTransform);
+    }
+
     const responseBody = createLoggedResponseStream(
-      upstreamResponse.body,
+      upstreamBodyForReply,
       clientRequest,
       targetUrl,
       upstreamResponse.statusCode,
@@ -468,6 +491,15 @@ function shouldTryEmulatedStreamingResponse(options) {
     && options.statusCode < 300;
 }
 
+function shouldNormaliseStreamingChatCompletionResponse(options) {
+  return NORMALISE_STREAMING_REASONING
+    && options.upstreamPath === '/v1/chat/completions'
+    && !options.streamingForcedOff
+    && options.clientStreamRequested
+    && options.statusCode >= 200
+    && options.statusCode < 300;
+}
+
 function createUpstreamRequestBody(body, upstreamPath) {
   if (!shouldForceNonStreaming(upstreamPath)) {
     return body;
@@ -617,6 +649,258 @@ function createLoggedResponseStream(upstreamBody, clientRequest, targetUrl, stat
   });
 
   return upstreamBody.pipe(loggingStream);
+}
+
+function createChatCompletionStreamCompatibilityTransform(clientRequest, targetUrl, startedAtNs) {
+  let bufferedText = '';
+
+  return new Transform({
+    transform(chunk, encoding, callback) {
+      bufferedText += Buffer.isBuffer(chunk)
+        ? chunk.toString('utf8')
+        : Buffer.from(chunk, encoding).toString('utf8');
+
+      const extraction = extractCompleteSseEvents(bufferedText);
+      bufferedText = extraction.remainder;
+
+      for (const eventText of extraction.events) {
+        this.push(normaliseChatCompletionSseEvent(eventText, clientRequest, targetUrl, startedAtNs));
+      }
+
+      callback();
+    },
+    flush(callback) {
+      if (bufferedText) {
+        this.push(normaliseChatCompletionSseEvent(bufferedText, clientRequest, targetUrl, startedAtNs));
+      }
+
+      callback();
+    }
+  });
+}
+
+function extractCompleteSseEvents(content) {
+  const events = [];
+  let remainder = content;
+
+  while (remainder) {
+    const separator = findSseEventSeparator(remainder);
+
+    if (!separator) {
+      break;
+    }
+
+    events.push(remainder.slice(0, separator.index));
+    remainder = remainder.slice(separator.index + separator.length);
+  }
+
+  return {
+    events,
+    remainder
+  };
+}
+
+function findSseEventSeparator(content) {
+  const lfIndex = content.indexOf('\n\n');
+  const crlfIndex = content.indexOf('\r\n\r\n');
+
+  if (lfIndex === -1 && crlfIndex === -1) {
+    return null;
+  }
+
+  if (lfIndex === -1) {
+    return {
+      index: crlfIndex,
+      length: 4
+    };
+  }
+
+  if (crlfIndex === -1) {
+    return {
+      index: lfIndex,
+      length: 2
+    };
+  }
+
+  if (lfIndex < crlfIndex) {
+    return {
+      index: lfIndex,
+      length: 2
+    };
+  }
+
+  return {
+    index: crlfIndex,
+    length: 4
+  };
+}
+
+function normaliseChatCompletionSseEvent(eventText, clientRequest, targetUrl, startedAtNs) {
+  if (!eventText) {
+    return '\n\n';
+  }
+
+  const lines = eventText.split(/\r?\n/);
+  const dataLineIndexes = [];
+  const dataParts = [];
+
+  for (const [index, line] of lines.entries()) {
+    if (!line.startsWith('data:')) {
+      continue;
+    }
+
+    dataLineIndexes.push(index);
+
+    const rawData = line.slice('data:'.length);
+    dataParts.push(rawData.startsWith(' ') ? rawData.slice(1) : rawData);
+  }
+
+  if (dataLineIndexes.length === 0) {
+    return `${eventText}\n\n`;
+  }
+
+  const dataText = dataParts.join('\n');
+
+  if (dataText.trim() === '[DONE]') {
+    return `${eventText}\n\n`;
+  }
+
+  let parsed;
+
+  try {
+    parsed = JSON.parse(dataText);
+  } catch (error) {
+    writeImportantLog('WARN', 'Failed to normalise streaming chat completion chunk', {
+      requestId: clientRequest.id,
+      method: clientRequest.method,
+      url: clientRequest.url,
+      targetUrl,
+      durationMs: getElapsedMs(startedAtNs),
+      error: createErrorLogValue(error)
+    });
+
+    return `${eventText}\n\n`;
+  }
+
+  const normalisedPayload = normaliseChatCompletionStreamPayload(parsed);
+  const normalisedDataLine = `data: ${JSON.stringify(normalisedPayload)}`;
+  const outputLines = [];
+  let dataLineWritten = false;
+
+  for (const [index, line] of lines.entries()) {
+    if (!dataLineIndexes.includes(index)) {
+      outputLines.push(line);
+      continue;
+    }
+
+    if (!dataLineWritten) {
+      outputLines.push(normalisedDataLine);
+      dataLineWritten = true;
+    }
+  }
+
+  return `${outputLines.join('\n')}\n\n`;
+}
+
+function normaliseChatCompletionStreamPayload(payload) {
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.choices)) {
+    return payload;
+  }
+
+  return {
+    ...payload,
+    choices: payload.choices.map(normaliseChatCompletionStreamChoice)
+  };
+}
+
+function normaliseChatCompletionStreamChoice(choice) {
+  if (!choice || typeof choice !== 'object') {
+    return choice;
+  }
+
+  const normalisedChoice = {
+    ...choice
+  };
+
+  if (normalisedChoice.delta && typeof normalisedChoice.delta === 'object') {
+    normalisedChoice.delta = normaliseChatCompletionDelta(normalisedChoice.delta);
+  }
+
+  return normalisedChoice;
+}
+
+function normaliseChatCompletionDelta(delta) {
+  const normalisedDelta = {
+    ...delta
+  };
+
+  normaliseReasoningField(normalisedDelta, 'reasoning_content');
+  normaliseReasoningField(normalisedDelta, 'reasoning');
+
+  return normalisedDelta;
+}
+
+function normaliseReasoningField(target, fieldName) {
+  if (!Object.prototype.hasOwnProperty.call(target, fieldName)) {
+    return;
+  }
+
+  if (STRIP_STREAMING_REASONING) {
+    delete target[fieldName];
+    return;
+  }
+
+  const normalisedValue = normaliseReasoningValue(target[fieldName]);
+
+  if (normalisedValue === undefined) {
+    delete target[fieldName];
+    return;
+  }
+
+  target[fieldName] = normalisedValue;
+}
+
+function normaliseReasoningValue(value) {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map(normaliseReasoningValue)
+      .filter((part) => part !== undefined)
+      .join('');
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+
+  if (typeof value !== 'object') {
+    return undefined;
+  }
+
+  for (const key of ['thinking', 'text', 'content', 'value', 'summary']) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) {
+      continue;
+    }
+
+    const normalisedValue = normaliseReasoningValue(value[key]);
+
+    if (normalisedValue !== undefined) {
+      return normalisedValue;
+    }
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch (error) {
+    return undefined;
+  }
 }
 
 function logProxyResponse(clientRequest, targetUrl, statusCode, startedAtNs, responseLogState, extraDetails = {}) {
