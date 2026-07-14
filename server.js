@@ -5,7 +5,7 @@ require('dotenv').config();
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { Transform } = require('node:stream');
+const { Readable, Transform } = require('node:stream');
 const Fastify = require('fastify');
 const cors = require('@fastify/cors');
 const { request: undiciRequest } = require('undici');
@@ -25,6 +25,10 @@ const LOG_BODY_CONTENT = parseBoolean(process.env.LOG_BODY_CONTENT, true);
 const LOG_MAX_BODY_CHARS = toPositiveInteger(process.env.LOG_MAX_BODY_CHARS || '20000', 20000);
 const NORMALISE_STREAMING_REASONING = parseBoolean(process.env.NORMALISE_STREAMING_REASONING, true);
 const STRIP_STREAMING_REASONING = parseBoolean(process.env.STRIP_STREAMING_REASONING, false);
+const REFERENCE_ERROR_RETRY_ENABLED = parseBoolean(process.env.REFERENCE_ERROR_RETRY_ENABLED, true);
+const REFERENCE_ERROR_RETRY_DELAY_MS = toNonNegativeInteger(process.env.REFERENCE_ERROR_RETRY_DELAY_MS, 1000);
+// Zero means retry until the upstream returns a usable response.
+const REFERENCE_ERROR_RETRY_MAX_ATTEMPTS = toNonNegativeInteger(process.env.REFERENCE_ERROR_RETRY_MAX_ATTEMPTS, 0);
 
 const PROXY_API_KEY = process.env.PROXY_API_KEY || '';
 const UPSTREAM_BASE_URL = normaliseBaseUrl(process.env.UPSTREAM_BASE_URL || '');
@@ -186,12 +190,14 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
   });
 
   try {
-    const upstreamResponse = await undiciRequest(targetUrl, {
+    const upstreamResponse = await requestUpstreamWithRetryableResponseRetries({
+      targetUrl,
       method,
       headers,
       body,
-      headersTimeout: HEADERS_TIMEOUT_MS,
-      bodyTimeout: BODY_TIMEOUT_MS
+      upstreamPath,
+      clientRequest,
+      startedAtNs
     });
 
     if (shouldTryEmulatedStreamingResponse({
@@ -264,6 +270,187 @@ async function proxyToUpstream(clientRequest, reply, upstreamPath) {
       }
     });
   }
+}
+
+async function requestUpstreamWithRetryableResponseRetries({
+  targetUrl,
+  method,
+  headers,
+  body,
+  upstreamPath,
+  clientRequest,
+  startedAtNs
+}) {
+  let retryAttempt = 0;
+
+  while (true) {
+    const upstreamResponse = await undiciRequest(targetUrl, {
+      method,
+      headers,
+      body,
+      headersTimeout: HEADERS_TIMEOUT_MS,
+      bodyTimeout: BODY_TIMEOUT_MS
+    });
+
+    if (!shouldInspectForRetryableResponse(upstreamPath)) {
+      return upstreamResponse;
+    }
+
+    const responseBuffer = await readStreamToBuffer(upstreamResponse.body);
+
+    if (!isRetryableChatCompletionResponse(responseBuffer)) {
+      return {
+        ...upstreamResponse,
+        body: Readable.from(responseBuffer)
+      };
+    }
+
+    retryAttempt += 1;
+
+    if (REFERENCE_ERROR_RETRY_MAX_ATTEMPTS > 0
+      && retryAttempt >= REFERENCE_ERROR_RETRY_MAX_ATTEMPTS) {
+      writeImportantLog('WARN', 'Retryable chat completion response limit reached', {
+        requestId: clientRequest.id,
+        method,
+        url: clientRequest.url,
+        targetUrl,
+        retryAttempt,
+        retryMaxAttempts: REFERENCE_ERROR_RETRY_MAX_ATTEMPTS,
+        durationMs: getElapsedMs(startedAtNs)
+      });
+
+      return {
+        ...upstreamResponse,
+        body: Readable.from(responseBuffer)
+      };
+    }
+
+    writeImportantLog('WARN', 'Retrying retryable chat completion response', {
+      requestId: clientRequest.id,
+      method,
+      url: clientRequest.url,
+      targetUrl,
+      retryAttempt,
+      retryMaxAttempts: REFERENCE_ERROR_RETRY_MAX_ATTEMPTS || 'unlimited',
+      retryDelayMs: REFERENCE_ERROR_RETRY_DELAY_MS,
+      durationMs: getElapsedMs(startedAtNs)
+    });
+
+    await delay(REFERENCE_ERROR_RETRY_DELAY_MS);
+  }
+}
+
+function shouldInspectForRetryableResponse(upstreamPath) {
+  return REFERENCE_ERROR_RETRY_ENABLED
+    && upstreamPath === '/v1/chat/completions';
+}
+
+function isRetryableChatCompletionResponse(responseBuffer) {
+  const responseText = responseBuffer.toString('utf8');
+  const completionContents = extractChatCompletionContents(responseText);
+
+  return isReferenceErrorMessage(completionContents.join(''))
+    || (completionContents.length === 0 && isReferenceErrorMessage(responseText))
+    || isUpstreamProviderUnavailableErrorResponse(responseText);
+}
+
+function isUpstreamProviderUnavailableErrorResponse(responseText) {
+  let payload;
+
+  try {
+    payload = JSON.parse(responseText);
+  } catch (error) {
+    return false;
+  }
+
+  return Boolean(payload
+    && typeof payload === 'object'
+    && !Array.isArray(payload)
+    && payload.error
+    && typeof payload.error === 'object'
+    && payload.error.message === 'The upstream provider is currently unavailable'
+    && payload.error.type === 'authentication_error');
+}
+
+function extractChatCompletionContents(responseText) {
+  const contents = [];
+  const payloads = [];
+
+  try {
+    payloads.push(JSON.parse(responseText));
+  } catch (error) {
+    for (const line of responseText.split(/\r?\n/)) {
+      if (!line.startsWith('data:')) {
+        continue;
+      }
+
+      const data = line.slice('data:'.length).trim();
+
+      if (!data || data === '[DONE]') {
+        continue;
+      }
+
+      try {
+        payloads.push(JSON.parse(data));
+      } catch (parseError) {
+        // Non-JSON SSE data cannot be a valid OpenAI chat completion payload.
+      }
+    }
+  }
+
+  for (const payload of payloads) {
+    if (!payload || typeof payload !== 'object' || !Array.isArray(payload.choices)) {
+      continue;
+    }
+
+    for (const choice of payload.choices) {
+      if (!choice || typeof choice !== 'object') {
+        continue;
+      }
+
+      for (const value of [choice.message && choice.message.content, choice.delta && choice.delta.content, choice.text]) {
+        const content = normaliseChatCompletionContent(value);
+
+        if (content !== '') {
+          contents.push(content);
+        }
+      }
+    }
+  }
+
+  return contents;
+}
+
+function normaliseChatCompletionContent(value) {
+  if (value === undefined || value === null) {
+    return '';
+  }
+
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(normaliseChatCompletionContent).join('');
+  }
+
+  if (typeof value === 'object') {
+    for (const key of ['text', 'content', 'value']) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        return normaliseChatCompletionContent(value[key]);
+      }
+    }
+  }
+
+  return '';
+}
+
+function isReferenceErrorMessage(content) {
+  return /^\s*\[An error occurred\. Reference: [^\]\r\n]+ at \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\]\s*$/.test(content);
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function sendBufferedChatCompletionResponse({
@@ -1285,6 +1472,20 @@ function toPositiveInteger(value, fallback) {
   return Math.floor(parsed);
 }
 
+function toNonNegativeInteger(value, fallback) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+
+  return Math.floor(parsed);
+}
+
 function validateConfig() {
   if (!UPSTREAM_BASE_URL) {
     throw new Error('UPSTREAM_BASE_URL is required');
@@ -1308,9 +1509,18 @@ async function start() {
   });
 }
 
-start().catch((error) => {
-  writeImportantLog('ERROR', 'Server failed to start', {
-    error: createErrorLogValue(error)
+if (require.main === module) {
+  start().catch((error) => {
+    writeImportantLog('ERROR', 'Server failed to start', {
+      error: createErrorLogValue(error)
+    });
+    process.exit(1);
   });
-  process.exit(1);
-});
+}
+
+module.exports = {
+  extractChatCompletionContents,
+  isReferenceErrorMessage,
+  isRetryableChatCompletionResponse,
+  isUpstreamProviderUnavailableErrorResponse
+};

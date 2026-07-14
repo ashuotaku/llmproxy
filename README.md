@@ -154,6 +154,34 @@ For a client streaming request where the proxy emulates the stream from a non-st
 
 responseMode="emulated_stream"
 
+## Reference-error retries
+
+Some providers return a successful chat completion whose assistant message is only a temporary error such as:
+
+```text
+[An error occurred. Reference: chat_1784015974183_qjmkktqug at 2026-07-14T07:59:40.306Z]
+```
+
+The proxy retries only that exact reference-bearing format and this exact upstream error payload:
+
+```json
+{"error":{"message":"The upstream provider is currently unavailable","type":"authentication_error"}}
+```
+
+It does not retry generic `An error occurred` messages, other authentication errors, or any other response. The upstream-unavailable payload is retried even if the provider sends it with a non-2xx status.
+
+This is enabled by default. Configure it in `.env`:
+
+```env
+REFERENCE_ERROR_RETRY_ENABLED=true
+REFERENCE_ERROR_RETRY_DELAY_MS=1000
+REFERENCE_ERROR_RETRY_MAX_ATTEMPTS=0
+```
+
+`REFERENCE_ERROR_RETRY_MAX_ATTEMPTS=0` means keep retrying until the upstream returns a different chat-completion response. Set a positive value if you want to cap retries; after the limit is reached, the last retryable response is returned unchanged.
+
+To reliably identify the response before sending it to the client, chat-completion responses are buffered while this feature is enabled. This means streaming clients receive the completed stream after the upstream response finishes.
+
 ## Log file
 
 Logs are written to a file instead of the terminal by default.
